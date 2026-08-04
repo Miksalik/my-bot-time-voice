@@ -5,7 +5,7 @@ import time
 import colorsys
 import os
 
-# Настройка намерений — для отслеживания войса нужен intents.voice_states
+# Настройка намерений
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.members = True
@@ -14,10 +14,14 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 active_sessions = {}
 
-# === НАСТРОЙКИ АДМИНИСТРАТОРОВ ===
-# Впишите сюда ID через запятую (например:)
-ADMIN_IDS = [1534155761608032336]  
-# ==============================
+# === ВАЖНЫЕ НАСТРОЙКИ СЕРВЕРА ===
+ADMIN_IDS = [
+    595594811239694374,
+    316985657371262988,
+    864117995932090389  # Впишите сюда ваш ID и ID других админов через запятую
+]
+LOG_CHANNEL_ID = 1534155761608032336  # ЗАМЕНИТЕ НА ID ТЕКСТОВОГО КАНАЛА ДЛЯ СТАТИСТИКИ И ОПОВЕЩЕНИЙ
+# ===============================
 
 # Подключение базы данных SQLite
 conn = sqlite3.connect("voice_time.db")
@@ -83,6 +87,19 @@ async def manage_time_roles(member, total_hours):
 
     if target_role not in member.roles:
         await member.add_roles(target_role)
+        
+        # ОТПРАВКА ОПОВЕЩЕНИЯ В КАНАЛ СТАТИСТИКИ
+        log_channel = bot.get_channel(LOG_CHANNEL_ID)
+        if log_channel:
+            embed_lvl = discord.Embed(
+                title="🎉 Новый Уровень Голосовой Активности!",
+                description=f"Пользователь {member.mention} преодолел отметку в **{current_milestone}** часов в голосовых каналах!",
+                color=final_hex
+            )
+            embed_lvl.add_field(name="Получена роль:", value=target_role.mention)
+            embed_lvl.set_thumbnail(url=member.avatar.url if member.avatar else None)
+            embed_lvl.set_footer(text="Повышение уровня в стиле Steam 🎮")
+            await log_channel.send(embed=embed_lvl)
 
     for role in member.roles:
         if "часов" in role.name and role.name != target_role_name:
@@ -94,8 +111,8 @@ async def manage_time_roles(member, total_hours):
 @bot.event
 async def on_ready():
     print(f"==========================================")
-    print(f"Бот {bot.user} запущен через os.getenv!")
-    print(f"Доступные команды: !time , !top")
+    print(f"Бот {bot.user} запущен и готов к работе!")
+    print(f"Канал для логов и команд установлен на ID: {LOG_CHANNEL_ID}")
     print(f"==========================================")
 
 @bot.event
@@ -121,12 +138,18 @@ async def on_voice_state_update(member, before, after):
             cursor.execute("SELECT total_seconds FROM users WHERE user_id = ?", (user_id,))
             total_seconds = cursor.fetchone()
             
-            # ДЛЯ ТЕСТА: удалите '/ 3600', чтобы считать секунды как часы
+            # Если тестируете, удалите '/ 3600'
             await manage_time_roles(member, total_seconds[0] / 3600)
 
 @bot.command(name="time")
 async def show_voice_time(ctx, target_member: discord.Member = None):
-    """Выводит личную статистику ИЛИ статистику другого человека для админов"""
+    """Выводит личную статистику ИЛИ статистику другого человека (только в канале логов или для админов)"""
+    # Проверка на правильный канал (Админы могут использовать везде)
+    if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
+        await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
+        await ctx.message.delete()
+        return
+
     current_time = int(time.time())
     
     if target_member is not None:
@@ -175,7 +198,12 @@ async def show_voice_time(ctx, target_member: discord.Member = None):
 
 @bot.command(name="top")
 async def show_top_users(ctx):
-    """Выводит топ-10 активных пользователей сервера"""
+    """Выводит топ-10 активных пользователей сервера (только в канале логов)"""
+    if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
+        await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
+        await ctx.message.delete()
+        return
+
     current_time = int(time.time())
     
     cursor.execute("SELECT user_id, total_seconds FROM users")
