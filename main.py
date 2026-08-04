@@ -5,11 +5,12 @@ import time
 import colorsys
 import os
 
-# Настройка намерений
+# Настройка намерений (Intents)
 intents = discord.Intents.default()
-intents.voice_states = True
-intents.members = True
-intents.message_content = True
+intents.voice_states = True      # Для отслеживания голосовых каналов
+intents.members = True           # Для управления ролями (Server Members Intent)
+intents.message_content = True   # Для чтения команд (Message Content Intent)
+intents.presences = True         # Добавьте эту строку, так как включен Presence Intent!
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 active_sessions = {}
