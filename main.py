@@ -140,7 +140,7 @@ async def on_voice_state_update(member, before, after):
             total_seconds = cursor.fetchone()
             
             # Если тестируете, удалите '/ 3600'
-            await manage_time_roles(member, total_seconds[0] / 3600)
+            await manage_time_roles(member, total_seconds)
 
 @bot.command(name="time")
 async def show_voice_time(ctx, target_member: discord.Member = None):
