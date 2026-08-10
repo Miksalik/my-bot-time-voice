@@ -1,31 +1,31 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import sqlite3
 import time
 import colorsys
 import os
 
-# Настройка намерений (Intents)
+# Настройка намерений
 intents = discord.Intents.default()
-intents.voice_states = True      # Для отслеживания голосовых каналов
-intents.members = True           # Для управления ролями (Server Members Intent)
-intents.message_content = True   # Для чтения команд (Message Content Intent)
-intents.presences = True         # Добавьте эту строку, так как включен Presence Intent!
+intents.voice_states = True
+intents.members = True
+intents.message_content = True
+intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 active_sessions = {}
 
 # === ВАЖНЫЕ НАСТРОЙКИ СЕРВЕРА ===
 ADMIN_IDS = [
-    595594811239694374,
-    316985657371262988,
-    864117995932090389  # Впишите сюда ваш ID и ID других админов через запятую
+    595594811239694374, 864117995932090389, 316985657371262988  # Впишите сюда ваш ID и ID других админов через запятую
 ]
 LOG_CHANNEL_ID = 1534155761608032336  # ЗАМЕНИТЕ НА ID ТЕКСТОВОГО КАНАЛА ДЛЯ СТАТИСТИКИ И ОПОВЕЩЕНИЙ
 # ===============================
 
 # Подключение базы данных SQLite
-conn = sqlite3.connect("voice_time.db")
+DATA_DIR = os.getenv('DATA_DIR', '/app/data')
+db_path = os.path.join(DATA_DIR, 'voice_time.db')
+conn = sqlite3.connect(db_path)
 cursor = conn.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
@@ -69,52 +69,102 @@ def adjust_brightness(hex_color, hours):
 
 async def manage_time_roles(member, total_hours):
     """Управляет созданием, покраской и выдачей ролей на сервере"""
-    current_milestone = (int(total_hours) // 10) * 10
-    if current_milestone == 0:
-        return
+    hours_int = int(total_hours)
+    
+    # 1. Определяем, какую роль нужно выдать
+    if hours_int >= 10:
+        current_milestone = (hours_int // 10) * 10
+        target_role_name = f"{current_milestone} часов"
+        digit = (current_milestone // 10) % 10
+        base_color = BASE_STEAM_COLORS[digit]
+        final_hex = adjust_brightness(base_color, current_milestone)
+    elif hours_int >= 5:
+        current_milestone = 5
+        target_role_name = "5 часов"
+        final_hex = 0x757575  # Глубокий серый
+    elif hours_int >= 1:
+        current_milestone = 1
+        target_role_name = "1 час"
+        final_hex = 0xffffff  # Чистый белый цвет на старте
+    else:
+        return  # Если меньше 1 часа, ничего не делаем
 
-    target_role_name = f"{current_milestone} часов"
     guild = member.guild
 
-    digit = (current_milestone // 10) % 10
-    base_color = BASE_STEAM_COLORS[digit]
-    final_hex = adjust_brightness(base_color, current_milestone)
-
+    # 2. Ищем или создаем роль
     target_role = discord.utils.get(guild.roles, name=target_role_name)
     if not target_role:
         role_color = discord.Color(final_hex)
         target_role = await guild.create_role(name=target_role_name, color=role_color, reason="Часовая система")
         print(f"[Успех] Создана роль: {target_role_name}")
 
+    # 3. Выдаем роль, если её еще нет
     if target_role not in member.roles:
         await member.add_roles(target_role)
         
-        # ОТПРАВКА ОПОВЕЩЕНИЯ В КАНАЛ СТАТИСТИКИ
-        log_channel = bot.get_channel(LOG_CHANNEL_ID)
-        if log_channel:
-            embed_lvl = discord.Embed(
-                title="🎉 Новый Уровень Голосовой Активности!",
-                description=f"Пользователь {member.mention} преодолел отметку в **{current_milestone}** часов в голосовых каналах!",
-                color=final_hex
-            )
-            embed_lvl.add_field(name="Получена роль:", value=target_role.mention)
-            embed_lvl.set_thumbnail(url=member.avatar.url if member.avatar else None)
-            embed_lvl.set_footer(text="Повышение уровня в стиле Steam 🎮")
-            await log_channel.send(embed=embed_lvl)
+        try:
+            log_channel = await bot.fetch_channel(LOG_CHANNEL_ID)
+            if log_channel:
+                hours_text = "час" if current_milestone == 1 else ("часа" if current_milestone == 5 else "часов")
+                await log_channel.send(f"🎉 Поздравляем {member.mention} с повышением уровня активности!")
+                
+                embed_lvl = discord.Embed(
+                    title="📈 Новый Уровень Голосовой Активности!",
+                    description=f"Вы провели уже целых **{current_milestone}** {hours_text} в голосовых каналах сервера!",
+                    color=final_hex
+                )
+                embed_lvl.add_field(name="Новая полученная роль:", value=target_role.mention)
+                embed_lvl.set_thumbnail(url=member.avatar.url if member.avatar else None)
+                embed_lvl.set_footer(text="Статус персонажа: Активен 🎮")
+                await log_channel.send(embed=embed_lvl)
+        except Exception as e:
+            print(f"[Ошибка отправки лога] Не удалось отправить сообщение в канал {LOG_CHANNEL_ID}: {e}")
 
+    # 4. Очищаем все остальные часовые роли (включая роли 1 час и 5 часов)
     for role in member.roles:
-        if "часов" in role.name and role.name != target_role_name:
+        if ("часов" in role.name or "час" in role.name) and role.name != target_role_name:
             try:
                 await member.remove_roles(role)
             except discord.Forbidden:
                 print(f"[Ошибка] Бот не может управлять ролью {role.name}. Поднимите его роль выше!")
 
+# Исправленная фоновая проверка в реальном времени
+@tasks.loop(seconds=60)
+async def check_live_voice_users():
+    current_time = int(time.time())
+    for user_id, join_time in list(active_sessions.items()):
+        duration = current_time - join_time
+        if duration <= 0:
+            continue
+            
+        active_sessions[user_id] = current_time
+        
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, total_seconds) VALUES (?, 0)", (user_id,))
+        cursor.execute("UPDATE users SET total_seconds = total_seconds + ? WHERE user_id = ?", (duration, user_id))
+        conn.commit()
+        
+        cursor.execute("SELECT total_seconds FROM users WHERE user_id = ?", (user_id,))
+        res = cursor.fetchone()
+        if res:
+            total_seconds = res[0]  # Исправлено: извлекаем число из кортежа базы данных
+            for guild in bot.guilds:
+                member = guild.get_member(user_id)
+                if not member:
+                    try:
+                        member = await guild.fetch_member(user_id)
+                    except:
+                        continue
+                if member:
+                    await manage_time_roles(member, total_seconds / 3600)
+
 @bot.event
 async def on_ready():
     print(f"==========================================")
-    print(f"Бот {bot.user} запущен и готов к работе!")
+    print(f"Бот {bot.user} успешно запущен и готов к работе!")
     print(f"Канал для логов и команд установлен на ID: {LOG_CHANNEL_ID}")
     print(f"==========================================")
+    if not check_live_voice_users.is_running():
+        check_live_voice_users.start()
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -124,9 +174,11 @@ async def on_voice_state_update(member, before, after):
     user_id = member.id
     current_time = int(time.time())
 
+    # Вход в голосовой канал
     if before.channel is None and after.channel is not None:
         active_sessions[user_id] = current_time
 
+    # Выход из голосового канала
     elif before.channel is not None and after.channel is None:
         if user_id in active_sessions:
             join_time = active_sessions.pop(user_id)
@@ -138,14 +190,12 @@ async def on_voice_state_update(member, before, after):
 
             cursor.execute("SELECT total_seconds FROM users WHERE user_id = ?", (user_id,))
             total_seconds = cursor.fetchone()
-            
-            # Если тестируете, удалите '/ 3600'
-            await manage_time_roles(member, total_seconds[0] / 3600)
+            if total_seconds:
+                await manage_time_roles(member, total_seconds[0] / 3600)
 
 @bot.command(name="time")
 async def show_voice_time(ctx, target_member: discord.Member = None):
-    """Выводит личную статистику ИЛИ статистику другого человека (только в канале логов или для админов)"""
-    # Проверка на правильный канал (Админы могут использовать везде)
+    """Выводит личную статистику ИЛИ статистику другого человека"""
     if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
         await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
         await ctx.message.delete()
@@ -180,7 +230,15 @@ async def show_voice_time(ctx, target_member: discord.Member = None):
     hours = saved_seconds // 3600
     minutes = (saved_seconds % 3600) // 60
 
-    next_milestone_hours = ((hours // 10) + 1) * 10
+    if hours < 1:
+        next_milestone_hours = 1
+    elif hours < 5:
+        next_milestone_hours = 5
+    elif hours < 10:
+        next_milestone_hours = 10
+    else:
+        next_milestone_hours = ((hours // 10) + 1) * 10
+
     remaining_seconds = (next_milestone_hours * 3600) - saved_seconds
     rem_hours = remaining_seconds // 3600
     rem_minutes = (remaining_seconds % 3600) // 60
@@ -190,7 +248,8 @@ async def show_voice_time(ctx, target_member: discord.Member = None):
     embed.add_field(name="⏱️ Наиграно времени:", value=f"**{hours}** ч. **{minutes}** мин.", inline=False)
     
     if hours < 2000:
-        embed.add_field(name="🎯 До следующей роли:", value=f"Осталось **{rem_hours}** ч. **{rem_minutes}** мин. (до {next_milestone_hours} ч.)", inline=False)
+        hours_text = "час" if next_milestone_hours == 1 else ("часа" if next_milestone_hours == 5 else "ч.")
+        embed.add_field(name="🎯 До следующей роли:", value=f"Осталось **{rem_hours}** ч. **{rem_minutes}** мин. (до {next_milestone_hours} {hours_text})", inline=False)
     else:
         embed.add_field(name="👑 Статус:", value="Максимальный уровень активности достигнут!", inline=False)
         
@@ -199,7 +258,7 @@ async def show_voice_time(ctx, target_member: discord.Member = None):
 
 @bot.command(name="top")
 async def show_top_users(ctx):
-    """Выводит топ-10 активных пользователей сервера (только в канале логов)"""
+    """Выводит топ-10 активных пользователей сервера"""
     if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
         await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
         await ctx.message.delete()
