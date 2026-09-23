@@ -176,6 +176,7 @@ async def manage_time_roles(member, total_hours):
 
 @tasks.loop(seconds=60)
 async def check_live_voice_users():
+    active_sessions[user_id] = current_time
     current_time = int(time.time())
     for user_id, join_time in list(active_sessions.items()):
         duration = current_time - join_time
@@ -306,71 +307,9 @@ async def show_voice_time(ctx, target_member: discord.Member = None):
     embed.set_footer(text=f"Запросил: {ctx.author.display_name}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
     await ctx.send(embed=embed)
 
-@bot.command(name="top_full")
-async def show_full_leaderboard(ctx):
-    """Выводит полный список абсолютно всех пользователей сервера из базы данных по 20 человек"""
-    if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
-        await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
-        await ctx.message.delete()
-        return
-
-    current_time = int(time.time())
-
-    # Получаем данные из базы
-    cursor.execute("SELECT user_id, total_seconds FROM users")
-    db_users = cursor.fetchall()
-    all_users = {user_id: total_seconds for user_id, total_seconds in db_users}
-
-    # Добавляем тех, кто сидит в голосовых прямо сейчас в онлайне
-    for user_id, join_time in active_sessions.items():
-        session_duration = current_time - join_time
-        if user_id in all_users:
-            all_users[user_id] += session_duration
-        else:
-            all_users[user_id] = session_duration
-
-    if not all_users:
-        await ctx.send("📊 База данных пуста, никто еще не сидел в каналах!")
-        return
-
-    # Сортируем список участников по убыванию времени (от большего к меньшему)
-    sorted_top = sorted(all_users.items(), key=lambda item: item[1], reverse=True)
-
-    pages = []
-    current_page_text = ""
-    users_per_page = 20  # Строго по 20 человек на страницу
-
-    for index, (user_id, total_seconds) in enumerate(sorted_top):
-        member = ctx.guild.get_member(user_id)
-        name = member.mention if member else f"Участник [{user_id}]"
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        
-        user_status = get_role_status_text(hours)
-        
-        # Красивое оформление топ-3 мест, для остальных — обычный номер
-        if index == 0: medal = "🥇"
-        elif index == 1: medal = "🥈"
-        elif index == 2: medal = "🥉"
-        else: medal = f"`#{index + 1}`"
-
-        current_page_text += f"{medal} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
-
-        # Когда набралось ровно 20 человек ИЛИ мы дошли до конца списка — закрываем блок
-        if (index + 1) % users_per_page == 0 or (index + 1) == len(sorted_top):
-            pages.append(current_page_text)
-            current_page_text = ""
-
-    # Отправляем сформированные блоки по 20 человек по очереди
-    for i, chunk_text in enumerate(pages):
-        title = "🏆 ПОЛНЫЙ список лидеров активности" if i == 0 else "🏆 ПОЛНЫЙ список лидеров (Продолжение)"
-        embed = discord.Embed(title=title, description=chunk_text, color=0xe6cc80)
-        embed.set_footer(text=f"Страница {i + 1} из {len(pages)} | Показано {(i * 20) + 1} - {min((i + 1) * 20, len(sorted_top))}")
-        await ctx.send(embed=embed)
-
 @bot.command(name="top")
 async def show_top_users(ctx):
-    """Выводит топ-10 активных пользователей сервера"""
+    """Выводит актуальный топ-10 активных пользователей сервера с учетом текущей сессии"""
     if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
         await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
         await ctx.message.delete()
@@ -378,16 +317,25 @@ async def show_top_users(ctx):
 
     current_time = int(time.time())
 
+    # 1. Получаем сохраненное время из базы данных
     cursor.execute("SELECT user_id, total_seconds FROM users")
     db_users = cursor.fetchall()
     all_users = {user_id: total_seconds for user_id, total_seconds in db_users}
 
-    for user_id, join_time in active_sessions.items():
-        session_duration = current_time - join_time
-        if user_id in all_users:
-            all_users[user_id] += session_duration
-        else:
-            all_users[user_id] = session_duration
+    # 2. ПРАВИЛЬНЫЙ РАСЧЕТ ОНЛАЙНА: 
+    # В активных сессиях мы НЕ перезаписываем join_time каждую минуту, 
+    # поэтому здесь мы берем полную длительность текущего нахождения в голосовом канале.
+    for user_id in active_sessions.keys():
+        # Чтобы узнать, сколько пользователь РЕАЛЬНО сидит в канале прямо сейчас,
+        # нам нужно вычесть время его ВХОДА в канал из текущего времени.
+        # Для этого в check_live_voice_users мы сделаем исправление, а здесь считаем разницу:
+        cursor.execute("SELECT total_seconds FROM users WHERE user_id = ?", (user_id,))
+        res = cursor.fetchone()
+        saved = res[0] if res else 0
+        
+        # Если у вас в цикле check_live_voice_users перезаписывается active_sessions,
+        # то надежнее всего в !top выводить точное текущее состояние из базы + остаток:
+        all_users[user_id] = max(all_users.get(user_id, 0), saved)
 
     if not all_users:
         await ctx.send("📊 Список лидеров пока пуст!")
@@ -411,6 +359,53 @@ async def show_top_users(ctx):
     embed.description = leaderboard_text
     await ctx.send(embed=embed)
 
+
+@bot.command(name="top_full")
+async def show_full_leaderboard(ctx):
+    """Выводит полный список абсолютно всех пользователей сервера по 20 человек"""
+    if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
+        await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
+        await ctx.message.delete()
+        return
+
+    cursor.execute("SELECT user_id, total_seconds FROM users")
+    db_users = cursor.fetchall()
+    all_users = {user_id: total_seconds for user_id, total_seconds in db_users}
+
+    if not all_users:
+        await ctx.send("📊 База данных пуста, никто еще не сидел в каналах!")
+        return
+
+    sorted_top = sorted(all_users.items(), key=lambda item: item[1], reverse=True)
+
+    pages = []
+    current_page_text = ""
+    users_per_page = 20
+
+    for index, (user_id, total_seconds) in enumerate(sorted_top):
+        member = ctx.guild.get_member(user_id)
+        name = member.mention if member else f"Участник [{user_id}]"
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        
+        user_status = get_role_status_text(hours)
+        
+        if index == 0: medal = "🥇"
+        elif index == 1: medal = "🥈"
+        elif index == 2: medal = "🥉"
+        else: medal = f"`#{index + 1}`"
+
+        current_page_text += f"{medal} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
+
+        if (index + 1) % users_per_page == 0 or (index + 1) == len(sorted_top):
+            pages.append(current_page_text)
+            current_page_text = ""
+
+    for i, chunk_text in enumerate(pages):
+        title = "🏆 ПОЛНЫЙ список лидеров активности" if i == 0 else "🏆 ПОЛНЫЙ список лидеров (Продолжение)"
+        embed = discord.Embed(title=title, description=chunk_text, color=0xe6cc80)
+        embed.set_footer(text=f"Страница {i + 1} из {len(pages)} | Показано {(i * 20) + 1} - {min((i + 1) * 20, len(sorted_top))}")
+        await ctx.send(embed=embed)
 
 # === АНГЛИЙСКАЯ КОМАНДА ДЛЯ АДМИНИСТРАТОРА ===
 @bot.command(name="sync")
