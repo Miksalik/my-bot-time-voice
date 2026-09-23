@@ -308,7 +308,7 @@ async def show_voice_time(ctx, target_member: discord.Member = None):
 
 @bot.command(name="top_full")
 async def show_full_leaderboard(ctx):
-    """Выводит полный список абсолютно всех пользователей сервера из базы данных"""
+    """Выводит полный список абсолютно всех пользователей сервера из базы данных по 20 человек"""
     if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
         await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
         await ctx.message.delete()
@@ -321,7 +321,7 @@ async def show_full_leaderboard(ctx):
     db_users = cursor.fetchall()
     all_users = {user_id: total_seconds for user_id, total_seconds in db_users}
 
-    # Добавляем тех, кто сидит в голосовых прямо сейчас
+    # Добавляем тех, кто сидит в голосовых прямо сейчас в онлайне
     for user_id, join_time in active_sessions.items():
         session_duration = current_time - join_time
         if user_id in all_users:
@@ -333,13 +333,13 @@ async def show_full_leaderboard(ctx):
         await ctx.send("📊 База данных пуста, никто еще не сидел в каналах!")
         return
 
-    # Сортируем список участников по убыванию времени
-    sorted_top = sorted(all_users.items(), key=lambda item: item, reverse=True)
+    # Сортируем список участников по убыванию времени (от большего к меньшему)
+    sorted_top = sorted(all_users.items(), key=lambda item: item[1], reverse=True)
 
-    # Собираем общий текст
-    embed_chunks = []
-    current_chunk_text = ""
-    
+    pages = []
+    current_page_text = ""
+    users_per_page = 20  # Строго по 20 человек на страницу
+
     for index, (user_id, total_seconds) in enumerate(sorted_top):
         member = ctx.guild.get_member(user_id)
         name = member.mention if member else f"Участник [{user_id}]"
@@ -348,28 +348,24 @@ async def show_full_leaderboard(ctx):
         
         user_status = get_role_status_text(hours)
         
+        # Красивое оформление топ-3 мест, для остальных — обычный номер
         if index == 0: medal = "🥇"
         elif index == 1: medal = "🥈"
         elif index == 2: medal = "🥉"
         else: medal = f"`#{index + 1}`"
 
-        line = f"{medal} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
-        
-        # Если текст превышает 3500 символов, отсекаем его в новый блок, чтобы не взорвать лимиты Discord
-        if len(current_chunk_text) + len(line) > 3500:
-            embed_chunks.append(current_chunk_text)
-            current_chunk_text = line
-        else:
-            current_chunk_text += line
+        current_page_text += f"{medal} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
 
-    if current_chunk_text:
-        embed_chunks.append(current_chunk_text)
+        # Когда набралось ровно 20 человек ИЛИ мы дошли до конца списка — закрываем блок
+        if (index + 1) % users_per_page == 0 or (index + 1) == len(sorted_top):
+            pages.append(current_page_text)
+            current_page_text = ""
 
-    # Отправляем блоки по очереди
-    for i, chunk_text in enumerate(embed_chunks):
+    # Отправляем сформированные блоки по 20 человек по очереди
+    for i, chunk_text in enumerate(pages):
         title = "🏆 ПОЛНЫЙ список лидеров активности" if i == 0 else "🏆 ПОЛНЫЙ список лидеров (Продолжение)"
         embed = discord.Embed(title=title, description=chunk_text, color=0xe6cc80)
-        embed.set_footer(text=f"Часть {i + 1} из {len(embed_chunks)}")
+        embed.set_footer(text=f"Страница {i + 1} из {len(pages)} | Показано {(i * 20) + 1} - {min((i + 1) * 20, len(sorted_top))}")
         await ctx.send(embed=embed)
 
 @bot.command(name="top")
