@@ -4,8 +4,9 @@ import sqlite3
 import time
 import os
 import re
+import asyncio  # Добавлено для безопасных пауз в асинхронных командах
 
-# Настройка намерений
+# Настройка намерений (Intents)
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.members = True
@@ -13,17 +14,20 @@ intents.message_content = True
 intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Словарь для отслеживания активных сессий в реальном времени
 active_sessions = {}
 
 # === ВАЖНЫЕ НАСТРОЙКИ СЕРВЕРА ===
 ADMIN_IDS = [
-    595594811239694374, 864117995932090389, 316985657371262988  # ID админов
+    595594811239694374, 864117995932090389, 316985657371262988  # ID админов сервера
 ]
 LOG_CHANNEL_ID = 1534155761608032336  # ID текстового канала для статистики и оповещений
 # ================================
 
 # Подключение базы данных SQLite
 DATA_DIR = os.getenv('DATA_DIR', '/app/data')
+os.makedirs(DATA_DIR, exist_ok=True)  # Защита от отсутствия папки на хостинге
 db_path = os.path.join(DATA_DIR, 'voice_time.db')
 conn = sqlite3.connect(db_path)
 cursor = conn.cursor()
@@ -34,7 +38,6 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 conn.commit()
-
 # Геймерская палитра цветов по степени редкости (Hex-коды)
 RARITY_COLORS = {
     "COMMON": 0x9d9d9d,       # Обычный (Серый)
@@ -72,6 +75,7 @@ HOURS_ROLES = {
     4500: {"name": "⛩️ Патриарх сервера", "emoji": "⛩️", "color": RARITY_COLORS["IMMORTAL"]},
     5000: {"name": "🪐 Повелитель Эфира", "emoji": "🪐", "color": RARITY_COLORS["IMMORTAL"]}
 }
+
 def get_new_nickname(current_name, hours, emoji):
     """Начисто стирает любые старые хвосты и возвращает ник со строгим отображением ЧАСОВ"""
     clean_name = re.sub(r'\s*\|\s*\d+ч.*$', '', current_name).strip()
@@ -89,7 +93,6 @@ def get_role_status_text(hours_int):
         if hours_int >= milestone:
             current_role_name = HOURS_ROLES[milestone]["name"]
     return current_role_name
-
 # Кэш для предотвращения спама поздравлениями в лог-канал
 last_promoted_hours = {}
 
@@ -113,11 +116,17 @@ async def manage_time_roles(member, total_hours):
     
     target_role = discord.utils.get(guild.roles, name=target_role_name)
     if not target_role:
-        target_role = await guild.create_role(name=target_role_name, color=discord.Color(final_hex), reason="Ранги")
+        try:
+            target_role = await guild.create_role(name=target_role_name, color=discord.Color(final_hex), reason="Ранги")
+        except discord.Forbidden:
+            return
         
     is_new_role_gained = target_role not in member.roles
     if is_new_role_gained:
-        await member.add_roles(target_role)
+        try:
+            await member.add_roles(target_role)
+        except discord.Forbidden:
+            pass
 
     for role in member.roles:
         if ("часов" in role.name or "час" in role.name or any(r["name"] == role.name for r in HOURS_ROLES.values())) and role.name != target_role_name:
@@ -126,18 +135,15 @@ async def manage_time_roles(member, total_hours):
             except discord.Forbidden:
                 pass
 
-    # Обновляем никнейм: передаем туда СТРОГО целые часы и эмодзи (без минут!)
     current_display_name = member.display_name
     new_nick = get_new_nickname(current_display_name, hours_int, role_emoji)
     
-    is_nick_changed = current_display_name != new_nick
-    if is_nick_changed:
+    if current_display_name != new_nick:
         try:
             await member.edit(nick=new_nick)
         except discord.Forbidden:
             pass
 
-    # Безопасное оповещение строго 1 раз в 10 часов
     already_notified = last_promoted_hours.get(member.id) == hours_int
     if not already_notified and (is_new_role_gained or (hours_int >= 10 and hours_int % 10 == 0)):
         last_promoted_hours[member.id] = hours_int
@@ -158,7 +164,6 @@ async def manage_time_roles(member, total_hours):
                 await log_channel.send(f"🎉 Поздравляем {member.mention}!", embed=embed_lvl)
         except:
             pass
-
 # === ЕЖЕМИНУТНЫЙ ФОНОВЫЙ ЦИКЛ С ТОЧНЫМ ПОДСЧЕТОМ СЕКУНД ===
 @tasks.loop(seconds=60)
 async def check_live_voice_users():
@@ -168,27 +173,24 @@ async def check_live_voice_users():
         if duration <= 0:
             continue
             
-        # Каждую минуту без задержек сохраняем время в базу SQLite
         cursor.execute("INSERT OR IGNORE INTO users (user_id, total_seconds) VALUES (?, 0)", (user_id,))
         cursor.execute("UPDATE users SET total_seconds = total_seconds + ? WHERE user_id = ?", [duration, user_id])
         conn.commit()
         
-        # Обновляем точку отсчета сессии для следующего круга
         active_sessions[user_id] = current_time
         
-        # Достаем точное число секунд из базы
         cursor.execute("SELECT total_seconds FROM users WHERE user_id = ?", (user_id,))
         res = cursor.fetchone()
         if res:
-            # Извлекаем чистое значение секунд из кортежа базы данных
-            total_seconds = res
+            # Извлекаем первый элемент кортежа
+            total_seconds = res[0]
             
             for guild in bot.guilds:
-                member = guild.get_member(user_id) or (await guild.fetch_member(user_id) if guild else None)
+                # Берем пользователя из локального кэша сервера
+                member = guild.get_member(user_id)
                 if member:
-                    # Передаем точное дробное значение часов. Внутри базы и команд 
-                    # минуты будут расти каждую минуту, а ник изменится только при смене целого часа!
                     await manage_time_roles(member, total_seconds / 3600.0)
+
 @bot.event
 async def on_ready():
     print("=========================================")
@@ -206,24 +208,28 @@ async def on_voice_state_update(member, before, after):
     user_id = member.id
     current_time = int(time.time())
     
-    if before.channel is None and after.channel is not None:
+    # Сценарий 1: Пользователь зашел в канал или переключился
+    if after.channel is not None and (before.channel is None or before.channel.id != after.channel.id):
         active_sessions[user_id] = current_time
         
+    # Сценарий 2: Пользователь полностью покинул голосовые каналы
     elif before.channel is not None and after.channel is None:
         if user_id in active_sessions:
             join_time = active_sessions.pop(user_id)
             duration = current_time - join_time
-            
-            cursor.execute("INSERT OR IGNORE INTO users (user_id, total_seconds) VALUES (?, 0)", (user_id,))
-            cursor.execute("UPDATE users SET total_seconds = total_seconds + ? WHERE user_id = ?", [duration, user_id])
-            conn.commit()
-
+            if duration > 0:
+                cursor.execute("INSERT OR IGNORE INTO users (user_id, total_seconds) VALUES (?, 0)", (user_id,))
+                cursor.execute("UPDATE users SET total_seconds = total_seconds + ? WHERE user_id = ?", [duration, user_id])
+                conn.commit()
 @bot.command(name="time")
 async def show_voice_time(ctx, target_member: discord.Member = None):
     """Выводит личную статистику или статистику другого человека с точными минутами"""
     if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
         await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
-        await ctx.message.delete()
+        try:
+            await ctx.message.delete()
+        except:
+            pass
         return
 
     current_time = int(time.time())
@@ -268,7 +274,7 @@ async def show_voice_time(ctx, target_member: discord.Member = None):
                 next_role_name = HOURS_ROLES[next_milestone_hours]["name"]
         else:
             if next_milestone_hours is None:
-                next_milestone_hours = milestones
+                next_milestone_hours = milestones[0]
                 next_role_name = HOURS_ROLES[next_milestone_hours]["name"]
             break
 
@@ -292,12 +298,16 @@ async def show_voice_time(ctx, target_member: discord.Member = None):
     embed.set_footer(text=f"Запросил: {ctx.author.display_name}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
     await ctx.send(embed=embed)
 
+
 @bot.command(name="top")
 async def show_top_users(ctx):
     """Выводит актуальный топ-10 активных пользователей сервера"""
     if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
         await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
-        await ctx.message.delete()
+        try:
+            await ctx.message.delete()
+        except:
+            pass
         return
 
     current_time = int(time.time())
@@ -317,7 +327,8 @@ async def show_top_users(ctx):
         await ctx.send("📊 Список лидеров пока пуст!")
         return
 
-    sorted_top = sorted(all_users.items(), key=lambda item: item, reverse=True)[:10]
+    # Исправленная точная сортировка словаря по секундам
+    sorted_top = sorted(all_users.items(), key=lambda item: item[1], reverse=True)[:10]
 
     embed = discord.Embed(title="🏆 ТОП-10 Активных в Голосовых Каналах", color=0xb6960d)
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -326,8 +337,10 @@ async def show_top_users(ctx):
     for index, (user_id, total_seconds) in enumerate(sorted_top):
         member = ctx.guild.get_member(user_id)
         if not member:
-            try: member = await ctx.guild.fetch_member(user_id)
-            except: pass
+            try:
+                member = await ctx.guild.fetch_member(user_id)
+            except:
+                pass
                 
         name = member.mention if member else f"Участник [{user_id}]"
         hours = total_seconds // 3600
@@ -338,13 +351,50 @@ async def show_top_users(ctx):
 
     embed.description = leaderboard_text
     await ctx.send(embed=embed)
+class LeaderboardPaginator(discord.ui.View):
+    def __init__(self, pages, total_pages):
+        super().__init__(timeout=60)
+        self.pages = pages
+        self.total_pages = total_pages
+        self.current_page = 0
+        self.message = None
+        self.update_button_states()
+
+    def update_button_states(self):
+        self.prev_page_btn.disabled = self.current_page == 0
+        self.next_page_btn.disabled = self.current_page == self.total_pages - 1
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except:
+                pass
+
+    @discord.ui.button(label="◀ Назад", style=discord.ButtonStyle.primary)
+    async def prev_page_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_button_states()
+            await interaction.response.edit_message(embed=self.pages[self.current_page], view=self)
+
+    @discord.ui.button(label="Вперед ▶", style=discord.ButtonStyle.primary)
+    async def next_page_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.update_button_states()
+            await interaction.response.edit_message(embed=self.pages[self.current_page], view=self)
+
 
 @bot.command(name="top_full")
 async def show_full_leaderboard(ctx):
-    """Выводит полный список абсолютно всех пользователей сервера из базы данных по 20 человек"""
+    """Выводит полный список абсолютно всех пользователей из базы данных по 20 человек"""
     if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
         await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
-        await ctx.message.delete()
+        try:
+            await ctx.message.delete()
+        except:
+            pass
         return
 
     current_time = int(time.time())
@@ -361,44 +411,47 @@ async def show_full_leaderboard(ctx):
             all_users[user_id] = session_duration
 
     if not all_users:
-        await ctx.send("📊 База данных пуста, никто еще не сидел в каналах!")
+        await ctx.send("📊 База данных активности пуста!")
         return
 
-    sorted_top = sorted(all_users.items(), key=lambda item: item, reverse=True)
-
-    pages = []
-    current_page_text = ""
-    users_per_page = 20
-
-    for index, (user_id, total_seconds) in enumerate(sorted_top):
-        member = ctx.guild.get_member(user_id)
-        if not member:
-            try: member = await ctx.guild.fetch_member(user_id)
-            except: pass
-
-        name = member.mention if member else f"Участник [{user_id}]"
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
+    sorted_users = sorted(all_users.items(), key=lambda item: item[1], reverse=True)
+    
+    per_page = 20
+    user_chunks = [sorted_users[i:i + per_page] for i in range(0, len(sorted_users), per_page)]
+    total_pages = len(user_chunks)
+    
+    embeds = []
+    
+    for page_index, chunk in enumerate(user_chunks):
+        embed = discord.Embed(title="📋 Полный список лидеров голосовых каналов", color=0x2b2d31)
+        leaderboard_text = ""
         
-        user_status = get_role_status_text(hours)
-        
-        if index == 0: medal = "🥇"
-        elif index == 1: medal = "🥈"
-        elif index == 2: medal = "🥉"
-        else: medal = f"`#{index + 1}`"
+        for index, (user_id, total_seconds) in enumerate(chunk):
+            global_index = page_index * per_page + index + 1
+            
+            member = ctx.guild.get_member(user_id)
+            if not member:
+                try:
+                    member = await ctx.guild.fetch_member(user_id)
+                except:
+                    pass
+            
+            name = member.mention if member else f"Участник [{user_id}]"
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
+            user_status = get_role_status_text(hours)
+            
+            leaderboard_text += f"`#{global_index:02d}` {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
+            
+        embed.description = leaderboard_text
+        embed.set_footer(text=f"Страница {page_index + 1} из {total_pages} • Всего участников: {len(sorted_users)}")
+        embeds.append(embed)
 
-        current_page_text += f"{medal} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
-
-        if (index + 1) % users_per_page == 0 or (index + 1) == len(sorted_top):
-            pages.append(current_page_text)
-            current_page_text = ""
-
-    for i, chunk_text in enumerate(pages):
-        title = "🏆 ПОЛНЫЙ список лидеров активности" if i == 0 else "🏆 ПОЛНЫЙ список лидеров (Продолжение)"
-        embed = discord.Embed(title=title, description=chunk_text, color=0xe6cc80)
-        embed.set_footer(text=f"Страница {i + 1} из {len(pages)} | Показано {(i * 20) + 1} - {min((i + 1) * 20, len(sorted_top))}")
-        await ctx.send(embed=embed)
-
+    if total_pages == 1:
+        await ctx.send(embed=embeds[0])
+    else:
+        view = LeaderboardPaginator(embeds, total_pages)
+        view.message = await ctx.send(embed=embeds[0], view=view)
 @bot.command(name="sync")
 async def sync_old_database(ctx):
     """Синхронизирует ники и роли всем игрокам на основе старой базы данных"""
@@ -406,27 +459,46 @@ async def sync_old_database(ctx):
         await ctx.send("❌ У вас нет прав для использования этой команды.")
         return
 
-    await ctx.send("⏳ Начинаю полную синхронизацию старой базы данных по системе редкости рангов...")
+    status_message = await ctx.send("⏳ Начинаю полную синхронизацию старой базы данных по системе редкости рангов...")
     
     cursor.execute("SELECT user_id, total_seconds FROM users")
     all_users = cursor.fetchall()
     
+    total_users_count = len(all_users)
     success_count = 0
-    for user_id, total_seconds in all_users:
+    
+    for index, (user_id, total_seconds) in enumerate(all_users):
         member = ctx.guild.get_member(user_id)
         if not member:
-            try: member = await ctx.guild.fetch_member(user_id)
-            except: continue
+            try:
+                member = await ctx.guild.fetch_member(user_id)
+            except:
+                continue
                 
         if member:
-            await manage_time_roles(member, total_seconds / 3600.0)
-            success_count += 1
-            time.sleep(0.5)
+            try:
+                await manage_time_roles(member, total_seconds / 3600.0)
+                success_count += 1
+            except discord.Forbidden:
+                pass
+            except Exception as e:
+                print(f"Ошибка при синхронизации пользователя {user_id}: {e}")
             
-    await ctx.send(f"✅ Синхронизация успешно завершена! Обновлено профилей пользователей: {success_count}.")
+            # Асинхронная безопасная пауза против блокировок со стороны API Дискорда
+            await asyncio.sleep(0.5)
+            
+        if index % 15 == 0 and index > 0:
+            try:
+                await status_message.edit(content=f"⏳ Синхронизация в процессе... Обработано {index}/{total_users_count} аккаунтов.")
+            except:
+                pass
+            
+    await ctx.send(f"✅ Синхронизация успешно завершена! Успешно обновлено профилей: **{success_count}** из **{total_users_count}**.")
+
 
 # Безопасный запуск бота через переменную среды хостинга
 token = os.getenv("BOT_TOKEN")
 if token:
     bot.run(token)
-else: print("Ошибка: Переменная BOT_TOKEN не настроена в панели хостинга!")
+else:
+    print("Ошибка: Переменная BOT_TOKEN не настроена в панели хостинга!")
