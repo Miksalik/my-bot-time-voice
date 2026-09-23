@@ -180,16 +180,21 @@ async def check_live_voice_users():
         if duration <= 0:
             continue
             
+        # 1. Записываем свежую минуту в базу данных
         cursor.execute("INSERT OR IGNORE INTO users (user_id, total_seconds) VALUES (?, 0)", (user_id,))
         cursor.execute("UPDATE users SET total_seconds = total_seconds + ? WHERE user_id = ?", (duration, user_id))
         conn.commit()
         
+        # Сдвигаем точку отсчета для онлайн-сессии
         active_sessions[user_id] = current_time
         
+        # 2. ИСПРАВЛЕНО: Безопасно вытаскиваем число через распаковку (res_tuple,)
         cursor.execute("SELECT total_seconds FROM users WHERE user_id = ?", (user_id,))
-        res = cursor.fetchone()
-        if res:
-            total_seconds = res[0]
+        res_tuple = cursor.fetchone()
+        if res_tuple:
+            # Распаковываем кортеж (например, из (1296900,) получаем чистое число 1296900)
+            total_seconds = res_tuple
+            
             for guild in bot.guilds:
                 member = guild.get_member(user_id)
                 if not member:
@@ -197,8 +202,11 @@ async def check_live_voice_users():
                         member = await guild.fetch_member(user_id)
                     except:
                         continue
+                        
                 if member:
+                    # Вызываем обновление ролей и проверку ранга на лету
                     await manage_time_roles(member, total_seconds / 3600.0)
+                    
 @bot.event
 async def on_ready():
     print("=========================================")
