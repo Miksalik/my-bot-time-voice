@@ -306,6 +306,72 @@ async def show_voice_time(ctx, target_member: discord.Member = None):
     embed.set_footer(text=f"Запросил: {ctx.author.display_name}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
     await ctx.send(embed=embed)
 
+@bot.command(name="top_full")
+async def show_full_leaderboard(ctx):
+    """Выводит полный список абсолютно всех пользователей сервера из базы данных"""
+    if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
+        await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
+        await ctx.message.delete()
+        return
+
+    current_time = int(time.time())
+
+    # Получаем данные из базы
+    cursor.execute("SELECT user_id, total_seconds FROM users")
+    db_users = cursor.fetchall()
+    all_users = {user_id: total_seconds for user_id, total_seconds in db_users}
+
+    # Добавляем тех, кто сидит в голосовых прямо сейчас
+    for user_id, join_time in active_sessions.items():
+        session_duration = current_time - join_time
+        if user_id in all_users:
+            all_users[user_id] += session_duration
+        else:
+            all_users[user_id] = session_duration
+
+    if not all_users:
+        await ctx.send("📊 База данных пуста, никто еще не сидел в каналах!")
+        return
+
+    # Сортируем список участников по убыванию времени
+    sorted_top = sorted(all_users.items(), key=lambda item: item, reverse=True)
+
+    # Собираем общий текст
+    embed_chunks = []
+    current_chunk_text = ""
+    
+    for index, (user_id, total_seconds) in enumerate(sorted_top):
+        member = ctx.guild.get_member(user_id)
+        name = member.mention if member else f"Участник [{user_id}]"
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        
+        user_status = get_role_status_text(hours)
+        
+        if index == 0: medal = "🥇"
+        elif index == 1: medal = "🥈"
+        elif index == 2: medal = "🥉"
+        else: medal = f"`#{index + 1}`"
+
+        line = f"{medal} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
+        
+        # Если текст превышает 3500 символов, отсекаем его в новый блок, чтобы не взорвать лимиты Discord
+        if len(current_chunk_text) + len(line) > 3500:
+            embed_chunks.append(current_chunk_text)
+            current_chunk_text = line
+        else:
+            current_chunk_text += line
+
+    if current_chunk_text:
+        embed_chunks.append(current_chunk_text)
+
+    # Отправляем блоки по очереди
+    for i, chunk_text in enumerate(embed_chunks):
+        title = "🏆 ПОЛНЫЙ список лидеров активности" if i == 0 else "🏆 ПОЛНЫЙ список лидеров (Продолжение)"
+        embed = discord.Embed(title=title, description=chunk_text, color=0xe6cc80)
+        embed.set_footer(text=f"Часть {i + 1} из {len(embed_chunks)}")
+        await ctx.send(embed=embed)
+
 @bot.command(name="top")
 async def show_top_users(ctx):
     """Выводит топ-10 активных пользователей сервера"""
@@ -385,69 +451,3 @@ if token:
     bot.run(token)
 else:
     print("Ошибка: Переменная BOT_TOKEN не настроена в панели хостинга!")
-
-@bot.command(name="top_full")
-async def show_full_leaderboard(ctx):
-    """Выводит полный список абсолютно всех пользователей сервера из базы данных"""
-    if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
-        await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
-        await ctx.message.delete()
-        return
-
-    current_time = int(time.time())
-
-    # Получаем данные из базы
-    cursor.execute("SELECT user_id, total_seconds FROM users")
-    db_users = cursor.fetchall()
-    all_users = {user_id: total_seconds for user_id, total_seconds in db_users}
-
-    # Добавляем тех, кто сидит в голосовых прямо сейчас
-    for user_id, join_time in active_sessions.items():
-        session_duration = current_time - join_time
-        if user_id in all_users:
-            all_users[user_id] += session_duration
-        else:
-            all_users[user_id] = session_duration
-
-    if not all_users:
-        await ctx.send("📊 База данных пуста, никто еще не сидел в каналах!")
-        return
-
-    # Сортируем список участников по убыванию времени
-    sorted_top = sorted(all_users.items(), key=lambda item: item, reverse=True)
-
-    # Собираем общий текст
-    embed_chunks = []
-    current_chunk_text = ""
-    
-    for index, (user_id, total_seconds) in enumerate(sorted_top):
-        member = ctx.guild.get_member(user_id)
-        name = member.mention if member else f"Участник [{user_id}]"
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        
-        user_status = get_role_status_text(hours)
-        
-        if index == 0: medal = "🥇"
-        elif index == 1: medal = "🥈"
-        elif index == 2: medal = "🥉"
-        else: medal = f"`#{index + 1}`"
-
-        line = f"{medal} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
-        
-        # Если текст превышает 3500 символов, отсекаем его в новый блок, чтобы не взорвать лимиты Discord
-        if len(current_chunk_text) + len(line) > 3500:
-            embed_chunks.append(current_chunk_text)
-            current_chunk_text = line
-        else:
-            current_chunk_text += line
-
-    if current_chunk_text:
-        embed_chunks.append(current_chunk_text)
-
-    # Отправляем блоки по очереди
-    for i, chunk_text in enumerate(embed_chunks):
-        title = "🏆 ПОЛНЫЙ список лидеров активности" if i == 0 else "🏆 ПОЛНЫЙ список лидеров (Продолжение)"
-        embed = discord.Embed(title=title, description=chunk_text, color=0xe6cc80)
-        embed.set_footer(text=f"Часть {i + 1} из {len(embed_chunks)}")
-        await ctx.send(embed=embed)
