@@ -386,42 +386,9 @@ if token:
 else:
     print("Ошибка: Переменная BOT_TOKEN не настроена в панели хостинга!")
 
-# === СТРУКТУРА КНОПОК ДЛЯ ПЕРЕЛИСТЫВАНИЯ СТРАНИЦ ПОЛНОГО ТОПА ===
-class TopFullPagination(discord.ui.View):
-    def __init__(self, pages, embed_title):
-        super().__init__(timeout=60)  # Кнопки активны 60 секунд
-        self.pages = pages
-        self.current_page = 0
-        self.title = embed_title
-
-    async def update_message(self, interaction: discord.Interaction):
-        embed = discord.Embed(title=self.title, color=0xe6cc80)
-        # ИСПРАВЛЕНО: Теперь гарантированно передается строка, а не список
-        embed.description = self.pages[self.current_page]
-        embed.set_footer(text=f"Страница {self.current_page + 1} из {len(self.pages)}")
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="◀ Предыдущая", style=discord.ButtonStyle.blurple)
-    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_page > 0:
-            self.current_page -= 1
-            await self.update_message(interaction)
-        else:
-            await interaction.response.send_message("👉 Вы находитесь на самой первой странице!", ephemeral=True)
-
-    @discord.ui.button(label="Следующая ▶", style=discord.ButtonStyle.blurple)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_page < len(self.pages) - 1:
-            self.current_page += 1
-            await self.update_message(interaction)
-        else:
-            await interaction.response.send_message("👈 Вы находитесь на самой последней странице!", ephemeral=True)
-
-
-# === ИСПРАВЛЕННАЯ КОМАНДА !top_full ===
 @bot.command(name="top_full")
 async def show_full_leaderboard(ctx):
-    """Выводит полный список всех пользователей сервера, у которых есть актив в БД"""
+    """Выводит полный список абсолютно всех пользователей сервера из базы данных"""
     if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
         await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
         await ctx.message.delete()
@@ -429,10 +396,12 @@ async def show_full_leaderboard(ctx):
 
     current_time = int(time.time())
 
+    # Получаем данные из базы
     cursor.execute("SELECT user_id, total_seconds FROM users")
     db_users = cursor.fetchall()
     all_users = {user_id: total_seconds for user_id, total_seconds in db_users}
 
+    # Добавляем тех, кто сидит в голосовых прямо сейчас
     for user_id, join_time in active_sessions.items():
         session_duration = current_time - join_time
         if user_id in all_users:
@@ -444,12 +413,13 @@ async def show_full_leaderboard(ctx):
         await ctx.send("📊 База данных пуста, никто еще не сидел в каналах!")
         return
 
-    sorted_top = sorted(all_users.items(), key=lambda item: item[1], reverse=True)
+    # Сортируем список участников по убыванию времени
+    sorted_top = sorted(all_users.items(), key=lambda item: item, reverse=True)
 
-    pages = []
-    current_page_text = ""
-    users_per_page = 15
-
+    # Собираем общий текст
+    embed_chunks = []
+    current_chunk_text = ""
+    
     for index, (user_id, total_seconds) in enumerate(sorted_top):
         member = ctx.guild.get_member(user_id)
         name = member.mention if member else f"Участник [{user_id}]"
@@ -463,21 +433,21 @@ async def show_full_leaderboard(ctx):
         elif index == 2: medal = "🥉"
         else: medal = f"`#{index + 1}`"
 
-        current_page_text += f"{medal} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
+        line = f"{medal} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
+        
+        # Если текст превышает 3500 символов, отсекаем его в новый блок, чтобы не взорвать лимиты Discord
+        if len(current_chunk_text) + len(line) > 3500:
+            embed_chunks.append(current_chunk_text)
+            current_chunk_text = line
+        else:
+            current_chunk_text += line
 
-        if (index + 1) % users_per_page == 0 or (index + 1) == len(sorted_top):
-            pages.append(current_page_text)
-            current_page_text = ""
+    if current_chunk_text:
+        embed_chunks.append(current_chunk_text)
 
-    embed_title = "🏆 ПОЛНЫЙ список лидеров голосовой активности"
-    embed = discord.Embed(title=embed_title, color=0xe6cc80)
-    
-    # ИСПРАВЛЕНО: Передаем первую страницу как текст из первого элемента списка
-    embed.description = pages[0]
-    embed.set_footer(text=f"Страница 1 из {len(pages)}")
-
-    if len(pages) == 1:
+    # Отправляем блоки по очереди
+    for i, chunk_text in enumerate(embed_chunks):
+        title = "🏆 ПОЛНЫЙ список лидеров активности" if i == 0 else "🏆 ПОЛНЫЙ список лидеров (Продолжение)"
+        embed = discord.Embed(title=title, description=chunk_text, color=0xe6cc80)
+        embed.set_footer(text=f"Часть {i + 1} из {len(embed_chunks)}")
         await ctx.send(embed=embed)
-    else:
-        view = TopFullPagination(pages, embed_title)
-        await ctx.send(embed=embed, view=view)
