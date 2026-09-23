@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import sqlite3
 import time
 import os
@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS users (
 """)
 conn.commit()
 
-# Геймерская палитра цветов по степени редкости
+# Геймерская палитра цветов по степени редкости (Hex-коды)
 RARITY_COLORS = {
     "COMMON": 0x9d9d9d,       # Обычный (Серый)
     "UNCOMMON": 0x1eff00,     # Необычный (Зеленый)
@@ -47,7 +47,7 @@ RARITY_COLORS = {
     "IMMORTAL": 0xe5c158      # Бессмертный (Переливчатый золотой)
 }
 
-# Сетка статусных ролей
+# Сетка статусных ролей с привязанными цветами редкости
 HOURS_ROLES = {
     1:    {"name": "🧭 Прохожий", "emoji": "🧭", "color": RARITY_COLORS["COMMON"]},
     5:    {"name": "⛺ Турист", "emoji": "⛺", "color": RARITY_COLORS["COMMON"]},
@@ -72,14 +72,14 @@ HOURS_ROLES = {
     4500: {"name": "⛩️ Патриарх сервера", "emoji": "⛩️", "color": RARITY_COLORS["IMMORTAL"]},
     5000: {"name": "🪐 Повелитель Эфира", "emoji": "🪐", "color": RARITY_COLORS["IMMORTAL"]}
 }
-last_promoted_hours = {}
-
 def get_new_nickname(current_name, hours, emoji):
     """Начисто стирает любые старые хвосты и возвращает ник со строгим отображением ЧАСОВ"""
     clean_name = re.sub(r'\s*\|\s*\d+ч.*$', '', current_name).strip()
     suffix = f" | {hours}ч{emoji}"
+    
     if len(clean_name) + len(suffix) > 32:
         clean_name = clean_name[:32 - len(suffix)]
+        
     return f"{clean_name}{suffix}"
 
 def get_role_status_text(hours_int):
@@ -90,8 +90,11 @@ def get_role_status_text(hours_int):
             current_role_name = HOURS_ROLES[milestone]["name"]
     return current_role_name
 
+# Кэш для предотвращения спама поздравлениями в лог-канал
+last_promoted_hours = {}
+
 async def manage_time_roles(member, total_hours):
-    """Управляет выдачей ролей по редкости и присылает логи строго один раз в 10 часов"""
+    """Управляет выдачей ролей редкости и обновляет никнейм строго в целых часах"""
     hours_int = int(total_hours)
     guild = member.guild
     
@@ -123,6 +126,7 @@ async def manage_time_roles(member, total_hours):
             except discord.Forbidden:
                 pass
 
+    # Обновляем никнейм: передаем туда СТРОГО целые часы и эмодзи (без минут!)
     current_display_name = member.display_name
     new_nick = get_new_nickname(current_display_name, hours_int, role_emoji)
     
@@ -133,69 +137,121 @@ async def manage_time_roles(member, total_hours):
         except discord.Forbidden:
             pass
 
+    # Безопасное оповещение строго 1 раз в 10 часов
     already_notified = last_promoted_hours.get(member.id) == hours_int
     if not already_notified and (is_new_role_gained or (hours_int >= 10 and hours_int % 10 == 0)):
         last_promoted_hours[member.id] = hours_int
         try:
             log_channel = await bot.fetch_channel(LOG_CHANNEL_ID)
             if log_channel:
-                if hours_int % 10 == 1 and hours_int % 100 != 11: hours_text = "час"
-                elif (hours_int % 10 == 2 or hours_int % 10 == 3 or hours_int % 10 == 4) and not (hours_int % 100 == 12 or hours_int % 100 == 13 or hours_int % 100 == 14): hours_text = "часа"
-                else: hours_text = "часов"
+                if hours_int % 10 == 1 and hours_int % 100 != 11:
+                    hours_text = "час"
+                elif (hours_int % 10 == 2 or hours_int % 10 == 3 or hours_int % 10 == 4) and not (hours_int % 100 == 12 or hours_int % 100 == 13 or hours_int % 100 == 14):
+                    hours_text = "часа"
+                else:
+                    hours_text = "часов"
 
                 embed_lvl = discord.Embed(title="📈 Прогресс активности!", description=f"Преодолена отметка в **{hours_int}** {hours_text}!", color=final_hex)
                 embed_lvl.add_field(name="Ранг:", value=target_role.mention)
-                if member.avatar: embed_lvl.set_thumbnail(url=member.avatar.url)
+                if member.avatar:
+                    embed_lvl.set_thumbnail(url=member.avatar.url)
                 await log_channel.send(f"🎉 Поздравляем {member.mention}!", embed=embed_lvl)
         except:
             pass
 
-def update_user_voice_time(user_id):
-    """Вспомогательная функция для мгновенного сохранения накопленного в сессии времени в БД"""
+# === ЕЖЕМИНУТНЫЙ ФОНОВЫЙ ЦИКЛ С ТОЧНЫМ ПОДСЧЕТОМ СЕКУНД ===
+@tasks.loop(seconds=60)
+async def check_live_voice_users():
     current_time = int(time.time())
-    if user_id in active_sessions:
-        duration = current_time - active_sessions[user_id]
-        if duration > 0:
-            cursor.execute("INSERT OR IGNORE INTO users (user_id, total_seconds) VALUES (?, 0)", (user_id,))
-            cursor.execute("UPDATE users SET total_seconds = total_seconds + ? WHERE user_id = ?", (duration, user_id))
-            conn.commit()
-            active_sessions[user_id] = current_time
-
+    for user_id, join_time in list(active_sessions.items()):
+        duration = current_time - join_time
+        if duration <= 0:
+            continue
+            
+        # Каждую минуту без задержек сохраняем время в базу SQLite
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, total_seconds) VALUES (?, 0)", (user_id,))
+        cursor.execute("UPDATE users SET total_seconds = total_seconds + ? WHERE user_id = ?", [duration, user_id])
+        conn.commit()
+        
+        # Обновляем точку отсчета сессии для следующего круга
+        active_sessions[user_id] = current_time
+        
+        # Достаем точное число секунд из базы
+        cursor.execute("SELECT total_seconds FROM users WHERE user_id = ?", (user_id,))
+        res = cursor.fetchone()
+        if res:
+            # Извлекаем чистое значение секунд из кортежа базы данных
+            total_seconds = res
+            
+            for guild in bot.guilds:
+                member = guild.get_member(user_id) or (await guild.fetch_member(user_id) if guild else None)
+                if member:
+                    # Передаем точное дробное значение часов. Внутри базы и команд 
+                    # минуты будут расти каждую минуту, а ник изменится только при смене целого часа!
+                    await manage_time_roles(member, total_seconds / 3600.0)
 @bot.event
 async def on_ready():
     print("=========================================")
-    print(f"Бот {bot.user} успешно переведен на событийную модель!")
+    print(f"Бот {bot.user} успешно запущен и готов к работе!")
+    print(f"Канал для логов и команд установлен на ID: {LOG_CHANNEL_ID}")
     print("=========================================")
+    if not check_live_voice_users.is_running():
+        check_live_voice_users.start()
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if member.bot: return
+    if member.bot:
+        return
+        
     user_id = member.id
     current_time = int(time.time())
     
-    # Смена канала или выход — мгновенно сохраняем время
-    if before.channel is not None:
-        update_user_voice_time(user_id)
-        if after.channel is None:
-            active_sessions.pop(user_id, None)
-            
-    # Вход в канал
-    if after.channel is not None and before.channel is None:
+    if before.channel is None and after.channel is not None:
         active_sessions[user_id] = current_time
+        
+    elif before.channel is not None and after.channel is None:
+        if user_id in active_sessions:
+            join_time = active_sessions.pop(user_id)
+            duration = current_time - join_time
+            
+            cursor.execute("INSERT OR IGNORE INTO users (user_id, total_seconds) VALUES (?, 0)", (user_id,))
+            cursor.execute("UPDATE users SET total_seconds = total_seconds + ? WHERE user_id = ?", [duration, user_id])
+            conn.commit()
+
 @bot.command(name="time")
 async def show_voice_time(ctx, target_member: discord.Member = None):
+    """Выводит личную статистику или статистику другого человека с точными минутами"""
     if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
-        await ctx.send("❌ Не тот канал!", delete_after=5)
+        await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
+        await ctx.message.delete()
         return
 
-    user_to_check = target_member if (target_member and ctx.author.id in ADMIN_IDS) else ctx.author
-    
-    # Принудительно сохраняем текущие набежавшие секунды перед чтением
-    update_user_voice_time(user_to_check.id)
+    current_time = int(time.time())
+
+    if target_member is not None:
+        if ctx.author.id not in ADMIN_IDS:
+            await ctx.send(f"❌ {ctx.author.mention}, у вас нет прав просматривать чужую статистику!")
+            return
+        user_to_check = target_member
+        is_checking_self = False
+    else:
+        user_to_check = ctx.author
+        is_checking_self = True
 
     cursor.execute("SELECT total_seconds FROM users WHERE user_id = ?", (user_to_check.id,))
-    res = cursor.fetchone()
-    saved_seconds = res[0] if res else 0
+    result = cursor.fetchone()
+    saved_seconds = result[0] if result else 0
+
+    # Плюсуем текущий хвостик онлайн-сессии для идеальной точности до секунды
+    if user_to_check.id in active_sessions:
+        saved_seconds += (current_time - active_sessions[user_to_check.id])
+
+    if saved_seconds == 0:
+        if is_checking_self:
+            await ctx.send(f"❌ {ctx.author.mention}, вы еще не сидели в голосовых каналах.")
+        else:
+            await ctx.send(f"⚠️ Участник {user_to_check.mention} еще не сидел в голосовых каналах.")
+        return
 
     hours = saved_seconds // 3600
     minutes = (saved_seconds % 3600) // 60
@@ -216,88 +272,161 @@ async def show_voice_time(ctx, target_member: discord.Member = None):
                 next_role_name = HOURS_ROLES[next_milestone_hours]["name"]
             break
 
-    embed = discord.Embed(title=f"📊 Активность: {user_to_check.display_name}", color=0x0070dd)
+    title_text = "📊 Ваша голосовая активность" if is_checking_self else f"📊 Активность: {user_to_check.display_name}"
+    embed = discord.Embed(title=title_text, color=0x0070dd)
     embed.add_field(name="⏳ Наиграно времени:", value=f"**{hours}** ч. **{minutes}** мин.", inline=False)
     embed.add_field(name="🛡️ Текущий ранг:", value=f"**{current_role_name}**", inline=True)
 
     if next_milestone_hours and hours < 5000:
         remaining_seconds = (next_milestone_hours * 3600) - saved_seconds
-        embed.add_field(name="🎯 До следующей роли:", value=f"Осталось **{remaining_seconds // 3600}** ч. **{(remaining_seconds % 3600) // 60}** мин. (до {next_role_name})", inline=False)
+        rem_hours = remaining_seconds // 3600
+        rem_minutes = (remaining_seconds % 3600) // 60
+        embed.add_field(
+            name="🎯 До следующей роли:", 
+            value=f"Осталось **{rem_hours}** ч. **{rem_minutes}** мин. (до **{next_role_name}** на {next_milestone_hours} ч.)", 
+            inline=False
+        )
+    else:
+        embed.add_field(name="Статус:", value="Максимальный уровень активности достигнут!", inline=False)
 
+    embed.set_footer(text=f"Запросил: {ctx.author.display_name}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
     await ctx.send(embed=embed)
-    if isinstance(user_to_check, discord.Member):
-        await manage_time_roles(user_to_check, saved_seconds / 3600.0)
 
 @bot.command(name="top")
 async def show_top_users(ctx):
-    if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS: return
-    
-    # Перед выводом топа принудительно сохраняем время всех, кто сидит онлайн прямо сейчас
-    for uid in list(active_sessions.keys()):
-        update_user_voice_time(uid)
-
-    cursor.execute("SELECT user_id, total_seconds FROM users")
-    all_users = {uid: sec for uid, sec in cursor.fetchall() if sec > 0}
-    if not all_users:
-        await ctx.send("📊 Топ пуст!")
+    """Выводит актуальный топ-10 активных пользователей сервера"""
+    if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
+        await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
+        await ctx.message.delete()
         return
 
-    sorted_top = sorted(all_users.items(), key=lambda item: item[1], reverse=True)[:10]
-    embed = discord.Embed(title="🏆 ТОП-10 Активных", color=0xb6960d)
+    current_time = int(time.time())
+
+    cursor.execute("SELECT user_id, total_seconds FROM users")
+    db_users = cursor.fetchall()
+    all_users = {user_id: total_seconds for user_id, total_seconds in db_users}
+
+    for user_id, join_time in active_sessions.items():
+        session_duration = current_time - join_time
+        if user_id in all_users:
+            all_users[user_id] += session_duration
+        else:
+            all_users[user_id] = session_duration
+
+    if not all_users:
+        await ctx.send("📊 Список лидеров пока пуст!")
+        return
+
+    sorted_top = sorted(all_users.items(), key=lambda item: item, reverse=True)[:10]
+
+    embed = discord.Embed(title="🏆 ТОП-10 Активных в Голосовых Каналах", color=0xb6960d)
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-    text = ""
+    leaderboard_text = ""
 
-    for idx, (uid, sec) in enumerate(sorted_top):
-        member = ctx.guild.get_member(uid) or (await ctx.guild.fetch_member(uid) if ctx.guild else None)
-        name = member.mention if member else f"Участник [{uid}]"
-        text += f"{medals[idx]} {name} — **{sec // 3600}** ч. **{(sec % 3600) // 60}** мин. ({get_role_status_text(sec // 3600)})\n"
+    for index, (user_id, total_seconds) in enumerate(sorted_top):
+        member = ctx.guild.get_member(user_id)
+        if not member:
+            try: member = await ctx.guild.fetch_member(user_id)
+            except: pass
+                
+        name = member.mention if member else f"Участник [{user_id}]"
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        
+        user_status = get_role_status_text(hours)
+        leaderboard_text += f"{medals[index]} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
 
-    embed.description = text
+    embed.description = leaderboard_text
     await ctx.send(embed=embed)
 
 @bot.command(name="top_full")
 async def show_full_leaderboard(ctx):
-    if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS: return
-    
-    for uid in list(active_sessions.keys()):
-        update_user_voice_time(uid)
+    """Выводит полный список абсолютно всех пользователей сервера из базы данных по 20 человек"""
+    if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
+        await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
+        await ctx.message.delete()
+        return
+
+    current_time = int(time.time())
 
     cursor.execute("SELECT user_id, total_seconds FROM users")
-    all_users = {uid: sec for uid, sec in cursor.fetchall() if sec > 0}
-    if not all_users: return
+    db_users = cursor.fetchall()
+    all_users = {user_id: total_seconds for user_id, total_seconds in db_users}
 
-    sorted_top = sorted(all_users.items(), key=lambda item: item[1], reverse=True)
-    pages, current_text, per_page = [], "", 20
+    for user_id, join_time in active_sessions.items():
+        session_duration = current_time - join_time
+        if user_id in all_users:
+            all_users[user_id] += session_duration
+        else:
+            all_users[user_id] = session_duration
 
-    for idx, (uid, sec) in enumerate(sorted_top):
-        member = ctx.guild.get_member(uid) or (await ctx.guild.fetch_member(uid) if ctx.guild else None)
-        name = member.mention if member else f"Участник [{uid}]"
-        medal = "🥇" if idx==0 else ("🥈" if idx==1 else ("🥉" if idx==2 else f"`#{idx+1}`"))
-        current_text += f"{medal} {name} — **{sec // 3600}** ч. **{(sec % 3600) // 60}** мин. ({get_role_status_text(sec // 3600)})\n"
+    if not all_users:
+        await ctx.send("📊 База данных пуста, никто еще не сидел в каналах!")
+        return
 
-        if (idx + 1) % per_page == 0 or (idx + 1) == len(sorted_top):
-            pages.append(current_text)
-            current_text = ""
+    sorted_top = sorted(all_users.items(), key=lambda item: item, reverse=True)
 
-    for i, t in enumerate(pages):
-        embed = discord.Embed(title="🏆 ПОЛНЫЙ список лидеров", description=t, color=0xe6cc80)
-        embed.set_footer(text=f"Страница {i+1} из {len(pages)}")
+    pages = []
+    current_page_text = ""
+    users_per_page = 20
+
+    for index, (user_id, total_seconds) in enumerate(sorted_top):
+        member = ctx.guild.get_member(user_id)
+        if not member:
+            try: member = await ctx.guild.fetch_member(user_id)
+            except: pass
+
+        name = member.mention if member else f"Участник [{user_id}]"
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        
+        user_status = get_role_status_text(hours)
+        
+        if index == 0: medal = "🥇"
+        elif index == 1: medal = "🥈"
+        elif index == 2: medal = "🥉"
+        else: medal = f"`#{index + 1}`"
+
+        current_page_text += f"{medal} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
+
+        if (index + 1) % users_per_page == 0 or (index + 1) == len(sorted_top):
+            pages.append(current_page_text)
+            current_page_text = ""
+
+    for i, chunk_text in enumerate(pages):
+        title = "🏆 ПОЛНЫЙ список лидеров активности" if i == 0 else "🏆 ПОЛНЫЙ список лидеров (Продолжение)"
+        embed = discord.Embed(title=title, description=chunk_text, color=0xe6cc80)
+        embed.set_footer(text=f"Страница {i + 1} из {len(pages)} | Показано {(i * 20) + 1} - {min((i + 1) * 20, len(sorted_top))}")
         await ctx.send(embed=embed)
 
 @bot.command(name="sync")
 async def sync_old_database(ctx):
-    if ctx.author.id not in ADMIN_IDS: return
-    await ctx.send("⏳ Синхронизация...")
-    cursor.execute("SELECT user_id, total_seconds FROM users")
-    success = 0
-    for uid, sec in cursor.fetchall():
-        member = ctx.guild.get_member(uid) or (await ctx.guild.fetch_member(uid) if ctx.guild else None)
-        if member:
-            await manage_time_roles(member, sec / 3600.0)
-            success += 1
-            time.sleep(0.3)
-    await ctx.send(f"✅ Обновлено: {success}.")
+    """Синхронизирует ники и роли всем игрокам на основе старой базы данных"""
+    if ctx.author.id not in ADMIN_IDS:
+        await ctx.send("❌ У вас нет прав для использования этой команды.")
+        return
 
+    await ctx.send("⏳ Начинаю полную синхронизацию старой базы данных по системе редкости рангов...")
+    
+    cursor.execute("SELECT user_id, total_seconds FROM users")
+    all_users = cursor.fetchall()
+    
+    success_count = 0
+    for user_id, total_seconds in all_users:
+        member = ctx.guild.get_member(user_id)
+        if not member:
+            try: member = await ctx.guild.fetch_member(user_id)
+            except: continue
+                
+        if member:
+            await manage_time_roles(member, total_seconds / 3600.0)
+            success_count += 1
+            time.sleep(0.5)
+            
+    await ctx.send(f"✅ Синхронизация успешно завершена! Обновлено профилей пользователей: {success_count}.")
+
+# Безопасный запуск бота через переменную среды хостинга
 token = os.getenv("BOT_TOKEN")
-if token: bot.run(token)
-else: print("Ошибка: BOT_TOKEN нет!")
+if token:
+    bot.run(token)
+else: print("Ошибка: Переменная BOT_TOKEN не настроена в панели хостинга!")
