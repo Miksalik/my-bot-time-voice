@@ -73,10 +73,10 @@ HOURS_ROLES = {
     5000: {"name": "🪐 Повелитель Эфира", "emoji": "🪐", "color": RARITY_COLORS["IMMORTAL"]}
 }
 
-def get_new_nickname(current_name, hours, emoji):
-    """Отрезает старый суффикс часов и возвращает имя с новым суффиксом и смайликом"""
-    clean_name = re.split(r'\s*\|\s*\d+ч.*$', current_name)[0]
-    suffix = f" | {hours}ч{emoji}"
+def get_new_nickname(current_name, hours, minutes, emoji):
+    """Отрезает старый суффикс часов и возвращает имя с новым суффиксом и минутами"""
+    clean_name = re.split(r'\s*\|\s*\d+ч.*\$', current_name)[0]
+    suffix = f" | {hours}ч {minutes}м{emoji}"
     
     if len(clean_name) + len(suffix) > 32:
         clean_name = clean_name[:32 - len(suffix)]
@@ -107,7 +107,7 @@ async def manage_time_roles(member, total_hours):
     role_info = HOURS_ROLES[target_milestone]
     target_role_name = role_info["name"]
     role_emoji = role_info["emoji"]
-    final_hex = role_info["color"]  # Берем фиксированный цвет редкости вместо Steam
+    final_hex = role_info["color"]
     
     # 2. Ищем или создаем роль с цветом редкости на сервере
     target_role = discord.utils.get(guild.roles, name=target_role_name)
@@ -131,9 +131,10 @@ async def manage_time_roles(member, total_hours):
             except discord.Forbidden:
                 print(f"[Ошибка] Бот не может управлять ролью {role.name}. Поднимите его роль выше в списке!")
 
-    # 5. Обновляем никнейм (Ставим часы и смайлик роли в конец)
+    # 5. Обновляем никнейм (Ставим точные часы, минуты и смайлик роли в конец)
+    minutes_int = int((total_hours - hours_int) * 60)
     current_display_name = member.display_name
-    new_nick = get_new_nickname(current_display_name, hours_int, role_emoji)
+    new_nick = get_new_nickname(current_display_name, hours_int, minutes_int, role_emoji)
     
     is_nick_changed = current_display_name != new_nick
     if is_nick_changed:
@@ -143,15 +144,13 @@ async def manage_time_roles(member, total_hours):
             print(f"[Ошибка] Нет прав на смену ника для {member.name} (владелец или админ).")
 
     # 6. ТРИГГЕР УВЕДОМЛЕНИЙ: Отправляем красивый лог каждые 10 часов ИЛИ при получении новой роли
-    # (hours_int % 10 == 0 и проверка смены ника гарантируют, что бот поздравит ровно один раз на отметках 10, 20, 30...)
     if is_new_role_gained or (hours_int >= 10 and hours_int % 10 == 0 and is_nick_changed):
         try:
             log_channel = await bot.fetch_channel(LOG_CHANNEL_ID)
             if log_channel:
-                # Склонение слова "час"
                 if hours_int % 10 == 1 and hours_int % 100 != 11:
                     hours_text = "час"
-                elif hours_int % 10 in [2, 3, 4] and hours_int % 100 not in [11, 12, 13, 14]:
+                elif hours_int % 10 in [2, 3, 4] and hours_int % 100 not in:
                     hours_text = "часа"
                 else:
                     hours_text = "часов"
@@ -173,7 +172,6 @@ async def manage_time_roles(member, total_hours):
         except Exception as e:
             print(f"[Ошибка отправки лога]: {e}")
 
-
 @tasks.loop(seconds=60)
 async def check_live_voice_users():
     current_time = int(time.time())
@@ -182,11 +180,11 @@ async def check_live_voice_users():
         if duration <= 0:
             continue
             
-        active_sessions[user_id] = current_time
-        
         cursor.execute("INSERT OR IGNORE INTO users (user_id, total_seconds) VALUES (?, 0)", (user_id,))
         cursor.execute("UPDATE users SET total_seconds = total_seconds + ? WHERE user_id = ?", (duration, user_id))
         conn.commit()
+        
+        active_sessions[user_id] = current_time
         
         cursor.execute("SELECT total_seconds FROM users WHERE user_id = ?", (user_id,))
         res = cursor.fetchone()
@@ -196,13 +194,11 @@ async def check_live_voice_users():
                 member = guild.get_member(user_id)
                 if not member:
                     try:
-                        # Принудительно скачиваем участника из Discord API, если его нет в кэше
                         member = await guild.fetch_member(user_id)
                     except:
                         continue
                 if member:
-                    await manage_time_roles(member, total_seconds / 3600)
-
+                    await manage_time_roles(member, total_seconds / 3600.0)
 @bot.event
 async def on_ready():
     print("=========================================")
@@ -220,11 +216,9 @@ async def on_voice_state_update(member, before, after):
     user_id = member.id
     current_time = int(time.time())
     
-    # Вход в голосовой канал
     if before.channel is None and after.channel is not None:
         active_sessions[user_id] = current_time
         
-    # Выход из голосового канала
     elif before.channel is not None and after.channel is None:
         if user_id in active_sessions:
             join_time = active_sessions.pop(user_id)
@@ -356,18 +350,26 @@ async def show_top_users(ctx):
     embed.description = leaderboard_text
     await ctx.send(embed=embed)
 
-
 @bot.command(name="top_full")
 async def show_full_leaderboard(ctx):
-    """Выводит полный список абсолютно всех пользователей сервера по 20 человек"""
+    """Выводит полный список абсолютно всех пользователей сервера из базы данных по 20 человек"""
     if ctx.channel.id != LOG_CHANNEL_ID and ctx.author.id not in ADMIN_IDS:
         await ctx.send(f"❌ {ctx.author.mention}, эту команду можно использовать только в канале <#{LOG_CHANNEL_ID}>!", delete_after=5)
         await ctx.message.delete()
         return
 
+    current_time = int(time.time())
+
     cursor.execute("SELECT user_id, total_seconds FROM users")
     db_users = cursor.fetchall()
     all_users = {user_id: total_seconds for user_id, total_seconds in db_users}
+
+    for user_id, join_time in active_sessions.items():
+        session_duration = current_time - join_time
+        if user_id in all_users:
+            all_users[user_id] += session_duration
+        else:
+            all_users[user_id] = session_duration
 
     if not all_users:
         await ctx.send("📊 База данных пуста, никто еще не сидел в каналах!")
@@ -381,6 +383,12 @@ async def show_full_leaderboard(ctx):
 
     for index, (user_id, total_seconds) in enumerate(sorted_top):
         member = ctx.guild.get_member(user_id)
+        if not member:
+            try:
+                member = await ctx.guild.fetch_member(user_id)
+            except:
+                pass
+
         name = member.mention if member else f"Участник [{user_id}]"
         hours = total_seconds // 3600
         minutes = (total_seconds % 3600) // 60
@@ -404,16 +412,14 @@ async def show_full_leaderboard(ctx):
         embed.set_footer(text=f"Страница {i + 1} из {len(pages)} | Показано {(i * 20) + 1} - {min((i + 1) * 20, len(sorted_top))}")
         await ctx.send(embed=embed)
 
-
-# === АНГЛИЙСКАЯ КОМАНДА ДЛЯ АДМИНИСТРАТОРА ===
 @bot.command(name="sync")
 async def sync_old_database(ctx):
-    """Синхронизирует ники и роли всем игрокам на основе старой базы данных"""
+    """Синхронизирует ники и роли всем игрокам на основе старой базы данных с учетом минут"""
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ У вас нет прав для использования этой команды.")
         return
 
-    await ctx.send("⏳ Начинаю синхронизацию старой базы данных. Это займет некоторое время...")
+    await ctx.send("⏳ Начинаю полную синхронизацию старой базы данных по системе редкости рангов...")
     
     cursor.execute("SELECT user_id, total_seconds FROM users")
     all_users = cursor.fetchall()
@@ -423,20 +429,19 @@ async def sync_old_database(ctx):
         member = ctx.guild.get_member(user_id)
         if not member:
             try:
-                member = await ctx.guild.fetch_member(user_id)
+                member = await guild.fetch_member(user_id)
             except:
                 continue
                 
         if member:
-            await manage_time_roles(member, total_seconds / 3600)
+            await manage_time_roles(member, total_seconds / 3600.0)
             success_count += 1
-            time.sleep(0.5)  # Задержка для предотвращения блокировок Discord API
+            time.sleep(0.5)
             
     await ctx.send(f"✅ Синхронизация успешно завершена! Обновлено профилей пользователей: {success_count}.")
 
-# Безопасный запуск бота
+# Безопасный запуск бота через переменную среды хостинга
 token = os.getenv("BOT_TOKEN")
 if token:
     bot.run(token)
 else:
-    print("Ошибка: Переменная BOT_TOKEN не настроена в панели хостинга!")
