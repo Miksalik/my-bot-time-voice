@@ -151,7 +151,7 @@ async def manage_time_roles(member, total_hours):
                 # Склонение слова "час"
                 if hours_int % 10 == 1 and hours_int % 100 != 11:
                     hours_text = "час"
-                elif hours_int % 10 in [2, 3, 4] and hours_int % 100 not in:
+                elif hours_int % 10 in [2, 3, 4] and hours_int % 100 not in [11, 12, 13, 14]:
                     hours_text = "часа"
                 else:
                     hours_text = "часов"
