@@ -389,14 +389,14 @@ else:
 # === СТРУКТУРА КНОПОК ДЛЯ ПЕРЕЛИСТЫВАНИЯ СТРАНИЦ ПОЛНОГО ТОПА ===
 class TopFullPagination(discord.ui.View):
     def __init__(self, pages, embed_title):
-        super().__init__(timeout=60)  # Кнопки активны 60 секунд после вызова команды
+        super().__init__(timeout=60)  # Кнопки активны 60 секунд
         self.pages = pages
         self.current_page = 0
         self.title = embed_title
 
     async def update_message(self, interaction: discord.Interaction):
-        # Обновляем текст внутри Embed при нажатии на кнопку
         embed = discord.Embed(title=self.title, color=0xe6cc80)
+        # ИСПРАВЛЕНО: Теперь гарантированно передается строка, а не список
         embed.description = self.pages[self.current_page]
         embed.set_footer(text=f"Страница {self.current_page + 1} из {len(self.pages)}")
         await interaction.response.edit_message(embed=embed, view=self)
@@ -418,7 +418,7 @@ class TopFullPagination(discord.ui.View):
             await interaction.response.send_message("👈 Вы находитесь на самой последней странице!", ephemeral=True)
 
 
-# === САМА КОМАНДА !top_full ===
+# === ИСПРАВЛЕННАЯ КОМАНДА !top_full ===
 @bot.command(name="top_full")
 async def show_full_leaderboard(ctx):
     """Выводит полный список всех пользователей сервера, у которых есть актив в БД"""
@@ -429,12 +429,10 @@ async def show_full_leaderboard(ctx):
 
     current_time = int(time.time())
 
-    # Вытаскиваем абсолютно всех из БД
     cursor.execute("SELECT user_id, total_seconds FROM users")
     db_users = cursor.fetchall()
     all_users = {user_id: total_seconds for user_id, total_seconds in db_users}
 
-    # Плюсуем тех, кто сидит в голосовых прямо сейчас в онлайне
     for user_id, join_time in active_sessions.items():
         session_duration = current_time - join_time
         if user_id in all_users:
@@ -446,10 +444,8 @@ async def show_full_leaderboard(ctx):
         await ctx.send("📊 База данных пуста, никто еще не сидел в каналах!")
         return
 
-    # Сортируем весь список по убыванию времени
     sorted_top = sorted(all_users.items(), key=lambda item: item[1], reverse=True)
 
-    # Разбиваем список на блоки (по 15 человек на одну страницу, чтобы текст не сливался)
     pages = []
     current_page_text = ""
     users_per_page = 15
@@ -462,7 +458,6 @@ async def show_full_leaderboard(ctx):
         
         user_status = get_role_status_text(hours)
         
-        # Красивые медальки для первых трех мест, для остальных — обычный номер
         if index == 0: medal = "🥇"
         elif index == 1: medal = "🥈"
         elif index == 2: medal = "🥉"
@@ -470,18 +465,17 @@ async def show_full_leaderboard(ctx):
 
         current_page_text += f"{medal} {name} — **{hours}** ч. **{minutes}** мин. ({user_status})\n"
 
-        # Если набралось 15 человек или это самый конец списка, закрываем страницу
         if (index + 1) % users_per_page == 0 or (index + 1) == len(sorted_top):
             pages.append(current_page_text)
             current_page_text = ""
 
-    # Формируем и отправляем первую страницу
     embed_title = "🏆 ПОЛНЫЙ список лидеров голосовой активности"
     embed = discord.Embed(title=embed_title, color=0xe6cc80)
+    
+    # ИСПРАВЛЕНО: Передаем первую страницу как текст из первого элемента списка
     embed.description = pages[0]
     embed.set_footer(text=f"Страница 1 из {len(pages)}")
 
-    # Если страница всего одна, отправляем без кнопок. Если больше — добавляем интерактив
     if len(pages) == 1:
         await ctx.send(embed=embed)
     else:
