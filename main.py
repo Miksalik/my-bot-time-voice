@@ -96,8 +96,9 @@ def get_role_status_text(hours_int):
 # Кэш для предотвращения спама поздравлениями в лог-канал
 last_promoted_hours = {}
 
+# === ОПТИМИЗИРОВАННЫЙ МЕНЕДЖЕР РОЛЕЙ И НИКНЕЙМОВ ===
 async def manage_time_roles(member, total_hours):
-    """Управляет выдачей ролей редкости и обновляет никнейм строго в целых часах"""
+    """Управляет выдачей ролей редкости и обновляет никнейм ТОЛЬКО при смене целого часа"""
     hours_int = int(total_hours)
     guild = member.guild
     
@@ -114,6 +115,7 @@ async def manage_time_roles(member, total_hours):
     role_emoji = role_info["emoji"]
     final_hex = role_info["color"]
     
+    # 1. Проверка и выдача роли
     target_role = discord.utils.get(guild.roles, name=target_role_name)
     if not target_role:
         try:
@@ -128,6 +130,7 @@ async def manage_time_roles(member, total_hours):
         except discord.Forbidden:
             pass
 
+    # Снимаем старые роли активности
     for role in member.roles:
         if ("часов" in role.name or "час" in role.name or any(r["name"] == role.name for r in HOURS_ROLES.values())) and role.name != target_role_name:
             try:
@@ -135,15 +138,32 @@ async def manage_time_roles(member, total_hours):
             except discord.Forbidden:
                 pass
 
+    # 2. УМНОЕ ОБНОВЛЕНИЕ НИКНЕЙМА (Защита от Rate Limit)
     current_display_name = member.display_name
+    
+    # Проверяем, записан ли уже СЛЕДУЮЩИЙ или ТЕКУЩИЙ правильный час в нике
+    # Регулярное выражение ищет хвостик "| количество_часов ч"
+    match = re.search(r'\|\s*(\d+)ч', current_display_name)
+    
+    if match:
+        existing_hours = int(match.group(1))
+        # ЕСЛИ ЧАСЫ В НИКЕ СОВПАДАЮТ С ЧАСАМИ В БАЗЕ — ИГНОРИРУЕМ И НЕ СПАМИМ ДИСКОРД!
+        if existing_hours == hours_int and not is_new_role_gained:
+            return
+
+    # Если часы изменились или получили новую роль — генерируем новый ник
     new_nick = get_new_nickname(current_display_name, hours_int, role_emoji)
     
     if current_display_name != new_nick:
         try:
             await member.edit(nick=new_nick)
+            print(f"[Успех] Никнейм пользователя {member.name} обновлен до {hours_int}ч.")
         except discord.Forbidden:
             pass
+        except discord.HTTPException as e:
+            print(f"[Ошибка API] Не удалось обновить ник {member.name}: {e}")
 
+    # 3. Оповещение в лог-канал
     already_notified = last_promoted_hours.get(member.id) == hours_int
     if not already_notified and (is_new_role_gained or (hours_int >= 10 and hours_int % 10 == 0)):
         last_promoted_hours[member.id] = hours_int
@@ -164,7 +184,9 @@ async def manage_time_roles(member, total_hours):
                 await log_channel.send(f"🎉 Поздравляем {member.mention}!", embed=embed_lvl)
         except:
             pass
-# === ЕЖЕМИНУТНЫЙ ФОНОВЫЙ ЦИКЛ С ТОЧНЫМ ПОДСЧЕТОМ СЕКУНД ===
+
+
+# === ЕЖЕМИНУТНЫЙ ФОНОВЫЙ ЦИКЛ С ИСПРАВЛЕННЫМ ВЫЗОВОМ ===
 @tasks.loop(seconds=60)
 async def check_live_voice_users():
     current_time = int(time.time())
@@ -182,14 +204,15 @@ async def check_live_voice_users():
         cursor.execute("SELECT total_seconds FROM users WHERE user_id = ?", (user_id,))
         res = cursor.fetchone()
         if res:
-            # Извлекаем первый элемент кортежа
+            # ИСПРАВЛЕНО: берем первый элемент из кортежа [0]
             total_seconds = res[0]
+            total_hours = total_seconds / 3600.0
             
             for guild in bot.guilds:
-                # Берем пользователя из локального кэша сервера
                 member = guild.get_member(user_id)
                 if member:
-                    await manage_time_roles(member, total_seconds / 3600.0)
+                    # Теперь эта функция не будет спамить каждую минуту!
+                    await manage_time_roles(member, total_hours)
 
 @bot.event
 async def on_ready():
